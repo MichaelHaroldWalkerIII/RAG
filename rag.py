@@ -2,7 +2,6 @@ import os
 import requests
 import time
 import json
-import numpy as np
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
@@ -12,15 +11,12 @@ import sqlite3
 import hashlib
 from datetime import datetime, timedelta
 
-# Enhanced imports for better sources
+# Lightweight imports - no heavy ML libraries
 try:
-    from sentence_transformers import SentenceTransformer
-    import faiss
-    from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
-    import torch
     import feedparser  # For RSS feeds
+    import numpy as np
 except ImportError:
-    print("Please install: pip install feedparser sentence-transformers faiss-cpu transformers torch beautifulsoup4 requests")
+    print("Please install: pip install feedparser beautifulsoup4 requests numpy")
     exit(1)
 
 @dataclass
@@ -32,7 +28,6 @@ class Document:
     chunk_id: str
     source_type: str  # New: track source type
     authority_score: float = 0.0  # New: source quality score
-    embedding: Optional[np.ndarray] = None
 
 class EnhancedWebSearcher:
     """Advanced web searcher with premium sources"""
@@ -76,42 +71,6 @@ class EnhancedWebSearcher:
             'cdc.gov': 0.95,
             'nih.gov': 0.95,
         }
-    
-    def search_news_api(self, query: str) -> List[Dict[str, Any]]:
-        """Search current news using NewsAPI"""
-        api_key = self.config.get('news_api_key')
-        if not api_key:
-            return []
-        
-        try:
-            url = "https://newsapi.org/v2/everything"
-            params = {
-                'q': query,
-                'apiKey': api_key,
-                'language': 'en',
-                'sortBy': 'relevancy',
-                'pageSize': 10
-            }
-            
-            response = self.session.get(url, params=params)
-            data = response.json()
-            
-            results = []
-            for article in data.get('articles', []):
-                if article.get('content') and article.get('content') != '[Removed]':
-                    results.append({
-                        'title': article.get('title', ''),
-                        'url': article.get('url', ''),
-                        'content': article.get('content', ''),
-                        'source_type': 'news',
-                        'authority_score': self._get_authority_score(article.get('url', '')),
-                        'published_at': article.get('publishedAt', '')
-                    })
-            
-            return results
-        except Exception as e:
-            print(f"NewsAPI error: {e}")
-            return []
     
     def search_arxiv(self, query: str) -> List[Dict[str, Any]]:
         """Search academic papers on arXiv"""
@@ -209,49 +168,6 @@ class EnhancedWebSearcher:
                 continue
         
         return results
-    
-    def search_github_repos(self, query: str) -> List[Dict[str, Any]]:
-        """Search GitHub for relevant repositories and documentation"""
-        github_token = self.config.get('github_token')
-        headers = {}
-        if github_token:
-            headers['Authorization'] = f'token {github_token}'
-        
-        try:
-            url = "https://api.github.com/search/repositories"
-            params = {
-                'q': f'{query} language:python OR language:javascript',
-                'sort': 'stars',
-                'order': 'desc',
-                'per_page': 5
-            }
-            
-            response = self.session.get(url, params=params, headers=headers)
-            data = response.json()
-            
-            results = []
-            for repo in data.get('items', []):
-                # Get README content
-                readme_url = f"https://api.github.com/repos/{repo['full_name']}/readme"
-                readme_response = self.session.get(readme_url, headers=headers)
-                
-                if readme_response.status_code == 200:
-                    readme_data = readme_response.json()
-                    import base64
-                    content = base64.b64decode(readme_data['content']).decode('utf-8')
-                    
-                    results.append({
-                        'title': f"GitHub: {repo['name']}",
-                        'url': repo['html_url'],
-                        'content': content[:2000],  # Limit content
-                        'source_type': 'code_repo',
-                        'authority_score': min(0.85, repo['stargazers_count'] / 1000)
-                    })
-            
-            return results
-        except Exception as e:
-            print(f"GitHub search error: {e}")
-            return []
     
     def search_scholarly_google(self, query: str) -> List[Dict[str, Any]]:
         """Search Google Scholar (basic scraping)"""
@@ -477,6 +393,135 @@ class EnhancedWebSearcher:
             print(f"Content extraction error for {url}: {e}")
             return None
 
+
+class TextProcessor:
+    """Process and chunk text documents"""
+    
+    def __init__(self, chunk_size: int = 512, chunk_overlap: int = 50):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+    
+    def chunk_text(self, text: str, url: str, title: str) -> List[Document]:
+        """Split text into overlapping chunks"""
+        chunks = []
+        
+        # Simple sentence-based chunking
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        current_chunk = []
+        current_size = 0
+        chunk_id = 0
+        
+        for sentence in sentences:
+            sentence_len = len(sentence)
+            
+            if current_size + sentence_len > self.chunk_size and current_chunk:
+                # Save current chunk
+                chunk_text = ' '.join(current_chunk)
+                doc = Document(
+                    content=chunk_text,
+                    url=url,
+                    title=title,
+                    timestamp=datetime.now(),
+                    chunk_id=f"{url}_{chunk_id}",
+                    source_type='unknown',
+                    authority_score=0.0
+                )
+                chunks.append(doc)
+                
+                # Start new chunk with overlap
+                overlap_start = max(0, len(current_chunk) - self.chunk_overlap // 10)
+                current_chunk = current_chunk[overlap_start:] + [sentence]
+                current_size = sum(len(s) for s in current_chunk)
+                chunk_id += 1
+            else:
+                current_chunk.append(sentence)
+                current_size += sentence_len
+        
+        # Don't forget the last chunk
+        if current_chunk:
+            chunk_text = ' '.join(current_chunk)
+            doc = Document(
+                content=chunk_text,
+                url=url,
+                title=title,
+                timestamp=datetime.now(),
+                chunk_id=f"{url}_{chunk_id}",
+                source_type='unknown',
+                authority_score=0.0
+            )
+            chunks.append(doc)
+        
+        return chunks
+
+
+class FreeVectorStore:
+    """Simple keyword-based vector store (no ML required)"""
+    
+    def __init__(self):
+        self.documents: List[Document] = []
+    
+    def _score_document(self, query: str, doc: Document) -> float:
+        """Simple keyword matching score"""
+        query_words = set(query.lower().split())
+        content_words = doc.content.lower()
+        title_words = doc.title.lower()
+        
+        # Score based on word matches in content and title
+        content_score = sum(1 for w in query_words if w in content_words) / max(len(query_words), 1)
+        title_score = sum(2 for w in query_words if w in title_words) / max(len(query_words) * 2, 1)
+        
+        return content_score + title_score + doc.authority_score * 0.1
+    
+    def add_documents(self, documents: List[Document]) -> int:
+        """Add documents to the store"""
+        self.documents.extend(documents)
+        return len(documents)
+    
+    def search(self, query: str, k: int = 5) -> List[Document]:
+        """Search for relevant documents using keyword matching"""
+        if not self.documents:
+            return []
+        
+        # Score all documents
+        scored = [(self._score_document(query, doc), doc) for doc in self.documents]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Return top k
+        return [doc for score, doc in scored[:k] if score > 0]
+    
+    def clear(self):
+        """Clear all documents"""
+        self.documents = []
+
+
+class FreeLLMClient:
+    """Simple text-based response generator (no ML required)"""
+    
+    def generate_response(self, question: str, documents: List[Document]) -> str:
+        """Generate a response based on retrieved documents"""
+        if not documents:
+            return "I couldn't find any relevant information to answer your question."
+        
+        # Build context from documents
+        context_parts = []
+        for i, doc in enumerate(documents[:3], 1):
+            # Extract relevant sentences containing query keywords
+            query_words = set(question.lower().split())
+            sentences = re.split(r'(?<=[.!?])\s+', doc.content)
+            relevant = [s for s in sentences if any(w in s.lower() for w in query_words)]
+            
+            if relevant:
+                excerpt = ' '.join(relevant[:3])
+            else:
+                excerpt = doc.content[:300]
+            
+            context_parts.append(f"[Source {i}] {doc.title}:\n{excerpt}...")
+        
+        context = "\n\n".join(context_parts)
+        
+        return f"Based on {len(documents)} sources found:\n\n{context}\n\n---\nTo get a generated answer, install: pip install transformers torch"
+
+
 class EnhancedRAGSystem:
     """Enhanced RAG system with premium sources"""
     
@@ -499,10 +544,10 @@ class EnhancedRAGSystem:
         """
         Comprehensive search across multiple premium sources
         
-        source_types: ['news', 'academic', 'reddit', 'github', 'rss', 'scholar', 'medical', 'financial']
+        source_types: ['academic', 'reddit', 'rss', 'scholar', 'medical', 'financial']
         """
         if source_types is None:
-            source_types = ['news', 'academic', 'reddit', 'rss', 'scholar']
+            source_types = ['academic', 'reddit', 'rss', 'scholar']
         
         print(f"Searching premium sources for: {query}")
         all_results = []
@@ -511,14 +556,10 @@ class EnhancedRAGSystem:
         for source_type in source_types:
             print(f"  Searching {source_type}...")
             
-            if source_type == 'news':
-                results = self.searcher.search_news_api(query)
-            elif source_type == 'academic':
+            if source_type == 'academic':
                 results = self.searcher.search_arxiv(query)
             elif source_type == 'reddit':
                 results = self.searcher.search_reddit_api(query)
-            elif source_type == 'github':
-                results = self.searcher.search_github_repos(query)
             elif source_type == 'rss':
                 results = self.searcher.search_rss_feeds(query)
             elif source_type == 'scholar':
@@ -618,39 +659,24 @@ class EnhancedRAGSystem:
             breakdown[source_type] = breakdown.get(source_type, 0) + 1
         return breakdown
 
-# Include your existing classes (TextProcessor, FreeVectorStore, FreeLLMClient) here...
-# [Previous implementations remain the same]
-
 def main():
-    """Enhanced main function with source configuration"""
+    """Enhanced main function with free sources only"""
     print("=" * 70)
-    print("ENHANCED RAG SYSTEM WITH PREMIUM SOURCES")
+    print("ENHANCED RAG SYSTEM WITH FREE SOURCES")
     print("=" * 70)
     
-    # Configuration (add your API keys here)
-    config = {
-        'news_api_key': os.getenv('NEWS_API_KEY'),  # Get free key at newsapi.org
-        'github_token': os.getenv('GITHUB_TOKEN'),  # GitHub personal access token
-        # Add other API keys as needed
-    }
+    # No API keys needed - using free sources only
+    config = {}
     
-    # Remove None values
-    config = {k: v for k, v in config.items() if v}
-    
-    if config:
-        print(f"Loaded {len(config)} API keys for premium sources")
-    else:
-        print("No API keys found - using free sources only")
-        print("Add API keys to environment variables for premium features:")
-        print("  NEWS_API_KEY, GITHUB_TOKEN")
+    print("Using free sources only (no API keys required)")
     
     # Initialize enhanced system
     rag_system = EnhancedRAGSystem(config)
     
     print("\nAvailable source types:")
-    print("  news, academic, reddit, github, rss, scholar, medical, financial")
+    print("  academic, reddit, rss, scholar, medical, financial")
     print("\nCommands:")
-    print("  'sources: news,academic' - specify source types")
+    print("  'sources: academic,rss' - specify source types")
     print("  'quit' - exit")
     print("=" * 70)
     
